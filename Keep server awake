@@ -1,0 +1,10 @@
+name: Keep server awake
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -s -m 90 https://yahoo-mail-mcp-server-elws.onrender.com/health
