@@ -11,12 +11,120 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
+import pdfParse from 'pdf-parse/lib/pdf-parse.js';
+import mammoth from 'mammoth';
+import ExcelJS from 'exceljs';
+import { convert as htmlToText } from 'html-to-text';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 
 // Load environment variables from .env file (for local development)
 dotenv.config();
+
+/**
+ * Attachment helpers
+ */
+const MAX_ATTACHMENT_TEXT = 100000;
+
+// Inline images (logos, signatures) aren't files the user would think of as attachments
+function isRealAttachment(att) {
+    if (att.related) return false;
+    const type = (att.contentType || '').toLowerCase();
+    if (att.contentDisposition === 'inline' && type.startsWith('image/')) return false;
+    return true;
+}
+
+function formatBytes(bytes) {
+    if (!bytes && bytes !== 0) return 'unknown size';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function attachmentSize(att) {
+    return att.size ?? att.content?.length ?? 0;
+}
+
+function describeAttachments(attachments) {
+    const list = (attachments || []).filter(isRealAttachment);
+    if (list.length === 0) return 'None';
+    return list.map((att, i) =>
+        `  [${i + 1}] ${att.filename || '(unnamed)'} (${att.contentType || 'unknown type'}, ${formatBytes(attachmentSize(att))})`
+    ).join('\n');
+}
+
+function csvCell(value) {
+    const s = value === null || value === undefined ? '' : String(value);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/**
+ * Extract readable text from a mailparser attachment.
+ * Returns { supported: boolean, kind: string, text: string }
+ */
+async function extractAttachmentText(att) {
+    const name = (att.filename || '').toLowerCase();
+    const ext = name.includes('.') ? name.split('.').pop() : '';
+    const type = (att.contentType || '').toLowerCase();
+    const buffer = att.content;
+
+    if (type === 'application/pdf' || ext === 'pdf') {
+        const result = await pdfParse(buffer);
+        return { supported: true, kind: 'PDF', text: result.text || '' };
+    }
+
+    if (ext === 'docx' || type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+        const result = await mammoth.extractRawText({ buffer });
+        return { supported: true, kind: 'Word document', text: result.value || '' };
+    }
+
+    if (ext === 'xlsx' || ext === 'xlsm' || type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') {
+        const workbook = new ExcelJS.Workbook();
+        await workbook.xlsx.load(buffer);
+        const sheets = [];
+        workbook.eachSheet((sheet) => {
+            const rows = [];
+            sheet.eachRow({ includeEmpty: false }, (row) => {
+                const cells = [];
+                for (let c = 1; c <= row.cellCount; c++) {
+                    cells.push(csvCell(row.getCell(c).text));
+                }
+                rows.push(cells.join(','));
+            });
+            sheets.push(`--- Sheet: ${sheet.name} ---\n${rows.join('\n')}`);
+        });
+        return { supported: true, kind: 'Spreadsheet (as CSV)', text: sheets.join('\n\n') };
+    }
+
+    if (ext === 'csv' || ext === 'tsv' || type === 'text/csv' || type === 'text/tab-separated-values') {
+        return { supported: true, kind: 'CSV', text: buffer.toString('utf8') };
+    }
+
+    if (ext === 'html' || ext === 'htm' || type === 'text/html') {
+        return { supported: true, kind: 'HTML', text: htmlToText(buffer.toString('utf8'), { wordwrap: false }) };
+    }
+
+    if (ext === 'eml' || type === 'message/rfc822') {
+        const parsed = await simpleParser(buffer);
+        const inner = (parsed.attachments || []).filter(isRealAttachment);
+        const text =
+            `From: ${parsed.from?.text || 'Unknown'}\n` +
+            `To: ${parsed.to?.text || 'Unknown'}\n` +
+            `Subject: ${parsed.subject || 'No Subject'}\n` +
+            `Date: ${parsed.date || 'Unknown Date'}\n` +
+            (inner.length ? `Attachments:\n${describeAttachments(inner)}\n` : '') +
+            `\n${parsed.text || (parsed.html ? htmlToText(parsed.html, { wordwrap: false }) : '')}`;
+        return { supported: true, kind: 'Email message', text };
+    }
+
+    const textExts = ['txt', 'text', 'md', 'json', 'xml', 'log', 'ics', 'vcf', 'yaml', 'yml'];
+    if (type.startsWith('text/') || textExts.includes(ext) || type === 'application/json' || type === 'application/xml') {
+        return { supported: true, kind: 'Text', text: buffer.toString('utf8') };
+    }
+
+    return { supported: false, kind: att.contentType || 'unknown type', text: '' };
+}
 
 class YahooMailMCPServer {
     constructor() {
@@ -98,6 +206,33 @@ class YahooMailMCPServer {
                                 }
                             },
                             required: ['uids']
+                        }
+                    },
+                    {
+                        name: 'read_attachment',
+                        description: 'Read the text of a file attached to an email. Works for PDF, Word (.docx), Excel (.xlsx), CSV, HTML, plain text and attached emails (.eml). read_email lists each email\'s attachments with their index numbers. Pictures and other unsupported files return their name, type and size only.',
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                uid: {
+                                    type: 'number',
+                                    description: 'UID of the email that has the attachment (from list_emails or search_emails)'
+                                },
+                                index: {
+                                    type: 'number',
+                                    description: 'Attachment number as shown by read_email, starting at 1. Use this or filename.'
+                                },
+                                filename: {
+                                    type: 'string',
+                                    description: 'Attachment filename (case-insensitive). Use this or index.'
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder containing the email (default: INBOX)',
+                                    default: 'INBOX'
+                                }
+                            },
+                            required: ['uid']
                         }
                     },
                     {
@@ -319,6 +454,13 @@ class YahooMailMCPServer {
 
                     case 'read_email':
                         return await this.readEmail(args.uids, args.folder);
+
+                    case 'read_attachment':
+                        return await this.readAttachment(args?.uid, {
+                            index: args?.index,
+                            filename: args?.filename,
+                            folder: args?.folder || 'INBOX'
+                        });
 
                     case 'search_emails':
                         return await this.searchEmails(args?.query || '', {
@@ -965,6 +1107,7 @@ class YahooMailMCPServer {
                                 return;
                             }
 
+                            const realAttachments = (parsed.attachments || []).filter(isRealAttachment);
                             emails.push({
                                 uid: attrs.uid,
                                 sequenceNumber: seqno,  // Still include for reference
@@ -974,7 +1117,8 @@ class YahooMailMCPServer {
                                 date: parsed.date || 'Unknown Date',
                                 size: attrs.size || 0,
                                 flags: attrs.flags || [],
-                                hasAttachments: this.hasAttachments(attrs.struct),
+                                hasAttachments: realAttachments.length > 0 || this.hasAttachments(attrs.struct),
+                                attachments: describeAttachments(realAttachments),
                                 content: parsed.text || parsed.html || 'No content available'
                             });
                             done();
@@ -1014,8 +1158,10 @@ class YahooMailMCPServer {
                         `Date: ${email.date}\n` +
                         `Size: ${email.size} bytes\n` +
                         `Flags: ${email.flags.join(', ') || 'None'}\n` +
-                        `Has Attachments: ${email.hasAttachments ? 'Yes' : 'No'}\n\n` +
-                        `--- Content ---\n` +
+                        `Has Attachments: ${email.hasAttachments ? 'Yes' : 'No'}\n` +
+                        `Attachments:\n${email.attachments === 'None' ? '  None' : email.attachments}\n` +
+                        (email.attachments === 'None' ? '' : `(Use read_attachment with uid ${email.uid} and the number above to read a file.)\n`) +
+                        `\n--- Content ---\n` +
                         `${email.content}`
                     ).join('\n\n' + '='.repeat(80) + '\n\n');
 
@@ -1028,6 +1174,125 @@ class YahooMailMCPServer {
                 });
             });
         });
+    }
+
+    /**
+     * Read the text of one attachment from an email
+     */
+    async readAttachment(uid, { index, filename, folder = 'INBOX' } = {}) {
+        if (typeof uid === 'string' && uid.trim() !== '') uid = Number(uid);
+        const validationError = this.validateUIDs([uid]);
+        if (validationError) {
+            return { content: [{ type: 'text', text: `Error: ${validationError}` }] };
+        }
+        if ((index === undefined || index === null) && !filename) {
+            return { content: [{ type: 'text', text: 'Error: Provide either index (from read_email) or filename.' }] };
+        }
+
+        const imap = await this.createImapConnection();
+
+        const raw = await new Promise((resolve, reject) => {
+            imap.openBox(folder, true, (err) => {  // true = read-only mode
+                if (err) {
+                    imap.end();
+                    reject(new Error(`Failed to open folder "${folder}": ${err.message}`));
+                    return;
+                }
+
+                // UID-based fetch (NOT imap.seq.fetch)
+                const fetch = imap.fetch(String(uid), { bodies: '' });
+                const chunks = [];
+                let found = false;
+
+                fetch.on('message', (msg) => {
+                    found = true;
+                    msg.on('body', (stream) => {
+                        stream.on('data', (chunk) => chunks.push(chunk));
+                    });
+                });
+
+                fetch.once('error', (fetchErr) => {
+                    imap.end();
+                    reject(fetchErr);
+                });
+
+                fetch.once('end', () => {
+                    imap.end();
+                    if (!found) {
+                        reject(new Error(`UID ${uid} not found in "${folder}". It may have been deleted or moved.`));
+                        return;
+                    }
+                    resolve(Buffer.concat(chunks));
+                });
+            });
+        });
+
+        const parsed = await simpleParser(raw);
+        const attachments = (parsed.attachments || []).filter(isRealAttachment);
+
+        if (attachments.length === 0) {
+            return { content: [{ type: 'text', text: `Email UID ${uid} has no attachments.` }] };
+        }
+
+        let att;
+        if (filename) {
+            const wanted = String(filename).toLowerCase();
+            att = attachments.find(a => (a.filename || '').toLowerCase() === wanted);
+        } else {
+            att = attachments[Number(index) - 1];
+        }
+
+        if (!att) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: Attachment ${filename ? `"${filename}"` : `#${index}`} not found on email UID ${uid}.\n` +
+                        `Attachments on this email:\n${describeAttachments(attachments)}`
+                }]
+            };
+        }
+
+        const label = `${att.filename || '(unnamed)'} (${att.contentType || 'unknown type'}, ${formatBytes(attachmentSize(att))})`;
+
+        let result;
+        try {
+            result = await extractAttachmentText(att);
+        } catch (extractErr) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `📎 ${label}\n\nCouldn't read this file: ${extractErr.message}. It may be damaged or password-protected.`
+                }]
+            };
+        }
+
+        if (!result.supported) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `📎 ${label}\n\nThis file type can't be read as text. Supported: PDF, Word (.docx), Excel (.xlsx), CSV, HTML, plain text and attached emails.`
+                }]
+            };
+        }
+
+        let text = result.text.trim();
+        let note = '';
+        if (text.length > MAX_ATTACHMENT_TEXT) {
+            note = `\n\n[Truncated: showing the first ${MAX_ATTACHMENT_TEXT.toLocaleString('en-US')} of ${text.length.toLocaleString('en-US')} characters.]`;
+            text = text.slice(0, MAX_ATTACHMENT_TEXT);
+        }
+        if (!text) {
+            text = result.kind === 'PDF'
+                ? '(No text found. This PDF may be a scanned image.)'
+                : '(The file is empty.)';
+        }
+
+        return {
+            content: [{
+                type: 'text',
+                text: `📎 ${label}\nRead as: ${result.kind}\n\n--- Attachment text ---\n${text}${note}`
+            }]
+        };
     }
 
     /**
@@ -1682,6 +1947,7 @@ class YahooMailMCPServer {
                 tools: [
                     'list_emails',
                     'read_email',
+                    'read_attachment',
                     'search_emails',
                     'delete_emails',
                     'archive_emails',
