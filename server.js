@@ -18,6 +18,7 @@ import { convert as htmlToText } from 'html-to-text';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 
 // Load environment variables from .env file (for local development)
 dotenv.config();
@@ -126,6 +127,68 @@ async function extractAttachmentText(att) {
     return { supported: false, kind: att.contentType || 'unknown type', text: '' };
 }
 
+/**
+ * Stateless OAuth tokens
+ *
+ * Tokens are signed with a key derived from OAUTH_CLIENT_SECRET instead of being
+ * kept in memory, so they stay valid when the server restarts or redeploys.
+ * Format: base64url(JSON payload) + "." + base64url(HMAC-SHA256 signature).
+ * Changing OAUTH_CLIENT_SECRET invalidates every token issued before.
+ */
+const AUTH_CODE_TTL_SECONDS = 5 * 60;                 // 5 minutes
+const ACCESS_TOKEN_TTL_SECONDS = 24 * 60 * 60;        // 24 hours
+const REFRESH_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60;  // 90 days
+
+function tokenSigningKey() {
+    const secret = process.env.OAUTH_CLIENT_SECRET;
+    if (!secret) throw new Error('OAUTH_CLIENT_SECRET is not set');
+    return crypto.createHmac('sha256', secret).update('yahoo-mail-mcp/token-signing/v1').digest();
+}
+
+function signToken(type, claims, ttlSeconds) {
+    const now = Math.floor(Date.now() / 1000);
+    const payload = {
+        ...claims,
+        typ: type,
+        cid: process.env.OAUTH_CLIENT_ID,
+        iat: now,
+        exp: now + ttlSeconds,
+        jti: crypto.randomBytes(16).toString('base64url')
+    };
+    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const sig = crypto.createHmac('sha256', tokenSigningKey()).update(body).digest('base64url');
+    return `${body}.${sig}`;
+}
+
+// Returns the payload if the token is genuine, unexpired, of the expected type and
+// issued to the configured client; otherwise null.
+function verifyToken(token, expectedType) {
+    try {
+        if (typeof token !== 'string' || token.length > 4096) return null;
+        const parts = token.split('.');
+        if (parts.length !== 2) return null;
+        const [body, sig] = parts;
+
+        const expected = crypto.createHmac('sha256', tokenSigningKey()).update(body).digest();
+        const given = Buffer.from(sig, 'base64url');
+        if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+
+        const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+        if (!payload || payload.typ !== expectedType) return null;
+        if (payload.cid !== process.env.OAUTH_CLIENT_ID) return null;
+        if (typeof payload.exp !== 'number' || payload.exp <= Math.floor(Date.now() / 1000)) return null;
+        return payload;
+    } catch {
+        return null;
+    }
+}
+
+function safeEqual(a, b) {
+    const ab = Buffer.from(String(a));
+    const bb = Buffer.from(String(b));
+    return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
 class YahooMailMCPServer {
     constructor() {
         this.server = new Server(
@@ -143,13 +206,10 @@ class YahooMailMCPServer {
         // Store active SSE transports (for routing messages)
         this.transports = new Map();
 
-        // Store valid OAuth access tokens (in-memory)
-        // In production, use Redis or a database with TTL
-        this.validTokens = new Set();
-
-        // Store authorization codes for OAuth authorization code flow
-        // In production, use Redis with short TTL (60 seconds)
-        this.authCodes = new Map();
+        // OAuth tokens are signed and stateless (see signToken/verifyToken), so they
+        // survive restarts. This only remembers redeemed auth codes (jti -> expiry)
+        // so a code can't be used twice while this process is running.
+        this.usedAuthCodes = new Map();
 
         this.setupToolHandlers();
         this.setupErrorHandling();
@@ -1383,26 +1443,32 @@ class YahooMailMCPServer {
      * Helper: Detect if email has attachments from BODYSTRUCTURE
      */
     hasAttachments(struct) {
-        if (!struct || !Array.isArray(struct)) return false;
+        if (!struct) return false;
 
-        // Recursive check for attachment disposition
-        const checkPart = (part) => {
-            if (!part) return false;
+        // node-imap's struct is a nested array: a multipart node is
+        // [ {type: 'mixed', ...}, [child], [child], ... ] and a leaf part is an object.
+        // Disposition types come back as the server sent them (often "ATTACHMENT").
+        const isAttachmentPart = (part) => {
+            const dispType = String(part.disposition?.type || '').toLowerCase();
+            const filename = part.disposition?.params?.filename || part.params?.name;
+            const mime = String(part.type || '').toLowerCase();
 
-            // Check if this part is an attachment
-            if (part.disposition && part.disposition.type === 'attachment') {
-                return true;
-            }
-
-            // Recursively check sub-parts
-            if (Array.isArray(part)) {
-                return part.some(p => checkPart(p));
-            }
-
+            if (dispType === 'attachment') return true;
+            // Inline images with names are usually logos/signatures, not files
+            if (dispType === 'inline' && filename && mime !== 'image') return true;
+            // Some mailers omit the disposition but name the file
+            if (!dispType && filename && mime === 'application') return true;
             return false;
         };
 
-        return checkPart(struct);
+        const walk = (node) => {
+            if (!node) return false;
+            if (Array.isArray(node)) return node.some(walk);
+            if (typeof node === 'object') return isAttachmentPart(node);
+            return false;
+        };
+
+        return walk(struct);
     }
 
     /**
@@ -1602,8 +1668,8 @@ class YahooMailMCPServer {
 
             const token = authHeader.substring(7); // Remove 'Bearer ' prefix
 
-            // Validate token (check if it's in our valid tokens set)
-            if (!this.validTokens || !this.validTokens.has(token)) {
+            // Validate token signature, type and expiry
+            if (!verifyToken(token, 'access')) {
                 console.error('[Auth] Invalid or expired access token');
                 return res.status(401).json({
                     error: 'invalid_token',
@@ -1625,7 +1691,7 @@ class YahooMailMCPServer {
                 issuer: baseUrl,
                 authorization_endpoint: `${baseUrl}/oauth/authorize`,
                 token_endpoint: `${baseUrl}/oauth/token`,
-                grant_types_supported: ['authorization_code', 'client_credentials'],
+                grant_types_supported: ['authorization_code', 'refresh_token', 'client_credentials'],
                 response_types_supported: ['code'],
                 token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
                 code_challenge_methods_supported: ['S256'],
@@ -1705,19 +1771,13 @@ class YahooMailMCPServer {
                 return res.status(400).send('Invalid redirect_uri');
             }
 
-            // Generate authorization code
-            const authCode = Buffer.from(`${client_id}:${Date.now()}:${Math.random()}`).toString('base64');
-
-            // Store auth code with PKCE challenge (in-memory - use Redis/DB in production)
-            if (!this.authCodes) this.authCodes = new Map();
-            this.authCodes.set(authCode, {
-                client_id,
+            // Generate a signed, short-lived authorization code carrying the PKCE challenge
+            const authCode = signToken('code', {
                 redirect_uri,
                 code_challenge,
                 code_challenge_method,
-                scope,
-                created_at: Date.now()
-            });
+                scope
+            }, AUTH_CODE_TTL_SECONDS);
 
             console.error('[OAuth] Authorization code generated, redirecting to:', redirect_uri);
 
@@ -1757,7 +1817,7 @@ class YahooMailMCPServer {
             }
 
             // Validate credentials
-            if (reqClientId !== clientId || reqClientSecret !== clientSecret) {
+            if (!safeEqual(reqClientId ?? '', clientId) || !safeEqual(reqClientSecret ?? '', clientSecret)) {
                 console.error('[OAuth] Authentication failed - invalid client credentials');
                 return res.status(401).json({
                     error: 'invalid_client',
@@ -1767,14 +1827,31 @@ class YahooMailMCPServer {
 
             const grantType = req.body?.grant_type;
 
+            // Issue an access token plus a refresh token
+            const issueTokens = (scope) => {
+                const tokenScope = scope || 'mcp';
+                return {
+                    access_token: signToken('access', { scope: tokenScope }, ACCESS_TOKEN_TTL_SECONDS),
+                    token_type: 'Bearer',
+                    expires_in: ACCESS_TOKEN_TTL_SECONDS,
+                    refresh_token: signToken('refresh', { scope: tokenScope }, REFRESH_TOKEN_TTL_SECONDS),
+                    scope: tokenScope
+                };
+            };
+
             // Handle Authorization Code Grant (with PKCE)
             if (grantType === 'authorization_code') {
                 const { code, redirect_uri, code_verifier } = req.body;
 
                 console.error('[OAuth] Authorization code grant - validating code');
 
-                // Validate authorization code
-                if (!this.authCodes || !this.authCodes.has(code)) {
+                const authData = verifyToken(code, 'code');
+                const now = Date.now();
+                for (const [jti, exp] of this.usedAuthCodes) {
+                    if (exp * 1000 <= now) this.usedAuthCodes.delete(jti);
+                }
+
+                if (!authData || this.usedAuthCodes.has(authData.jti)) {
                     console.error('[OAuth] Invalid or expired authorization code');
                     return res.status(400).json({
                         error: 'invalid_grant',
@@ -1782,13 +1859,21 @@ class YahooMailMCPServer {
                     });
                 }
 
-                const authData = this.authCodes.get(code);
+                // redirect_uri must match the one the code was issued for
+                if (redirect_uri && authData.redirect_uri && redirect_uri !== authData.redirect_uri) {
+                    console.error('[OAuth] redirect_uri mismatch');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'redirect_uri does not match'
+                    });
+                }
 
                 // Validate PKCE code verifier
                 if (authData.code_challenge) {
-                    const crypto = await import('crypto');
-                    const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
-                    if (hash !== authData.code_challenge) {
+                    const hash = typeof code_verifier === 'string'
+                        ? crypto.createHash('sha256').update(code_verifier).digest('base64url')
+                        : '';
+                    if (!safeEqual(hash, authData.code_challenge)) {
                         console.error('[OAuth] PKCE validation failed');
                         return res.status(400).json({
                             error: 'invalid_grant',
@@ -1797,35 +1882,38 @@ class YahooMailMCPServer {
                     }
                 }
 
-                // Delete used auth code (one-time use)
-                this.authCodes.delete(code);
-
-                // Generate access token
-                const accessToken = Buffer.from(`${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                // Auth codes are one-time use
+                this.usedAuthCodes.set(authData.jti, authData.exp);
 
                 console.error('[OAuth] Access token generated from authorization code');
 
-                return res.json({
-                    access_token: accessToken,
-                    token_type: 'Bearer',
-                    expires_in: 3600,
-                    scope: authData.scope || 'mcp'
-                });
+                return res.json(issueTokens(authData.scope));
+            }
+
+            // Handle Refresh Token Grant (works across restarts: tokens are signed, not stored)
+            if (grantType === 'refresh_token') {
+                const refreshData = verifyToken(req.body?.refresh_token, 'refresh');
+                if (!refreshData) {
+                    console.error('[OAuth] Invalid or expired refresh token');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'Invalid or expired refresh token'
+                    });
+                }
+
+                console.error('[OAuth] Access token refreshed');
+
+                return res.json(issueTokens(refreshData.scope));
             }
 
             // Handle Client Credentials Grant
             if (grantType === 'client_credentials') {
-                // Generate access token
-                const accessToken = Buffer.from(`${clientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
-
                 console.error('[OAuth] Access token generated via client credentials');
 
                 return res.json({
-                    access_token: accessToken,
+                    access_token: signToken('access', { scope: 'mcp' }, ACCESS_TOKEN_TTL_SECONDS),
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: ACCESS_TOKEN_TTL_SECONDS,
                     scope: 'mcp'
                 });
             }
@@ -1834,7 +1922,7 @@ class YahooMailMCPServer {
             console.error('[OAuth] Unsupported grant type:', grantType);
             res.status(400).json({
                 error: 'unsupported_grant_type',
-                error_description: 'Supported grant types: authorization_code, client_credentials'
+                error_description: 'Supported grant types: authorization_code, refresh_token, client_credentials'
             });
         });
 
