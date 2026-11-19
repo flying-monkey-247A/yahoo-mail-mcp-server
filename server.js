@@ -530,7 +530,8 @@ class YahooMailMCPServer {
                 // Fetch with struct for attachments and size
                 const fetch = imap.seq.fetch(`${startSeq}:${endSeq}`, {
                     bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                    struct: true
+                    struct: true,
+                    size: true
                 });
 
                 const emails = [];
@@ -733,7 +734,8 @@ class YahooMailMCPServer {
                     // Fetch details for these UIDs
                     const fetch = imap.fetch(limitedResults, {
                         bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                        struct: true
+                        struct: true,
+                        size: true
                     });
 
                     const emails = [];
@@ -932,19 +934,21 @@ class YahooMailMCPServer {
                 // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
                 const fetch = imap.fetch(source, {
                     bodies: '',
-                    struct: true
+                    struct: true,
+                    size: true
                 });
 
                 const emails = [];
                 const foundUIDs = new Set();
+                const parses = [];
 
                 fetch.on('message', (msg, seqno) => {
-                    let buffer = '';
+                    const chunks = [];
                     let attrs = null;
 
                     msg.on('body', (stream, info) => {
                         stream.on('data', (chunk) => {
-                            buffer += chunk.toString('ascii');
+                            chunks.push(chunk);
                         });
                     });
 
@@ -954,9 +958,10 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        simpleParser(buffer, (err, parsed) => {
+                        parses.push(new Promise((done) => simpleParser(Buffer.concat(chunks), (err, parsed) => {
                             if (err) {
                                 console.error('Error parsing email:', err);
+                                done();
                                 return;
                             }
 
@@ -972,7 +977,8 @@ class YahooMailMCPServer {
                                 hasAttachments: this.hasAttachments(attrs.struct),
                                 content: parsed.text || parsed.html || 'No content available'
                             });
-                        });
+                            done();
+                        })));
                     });
                 });
 
@@ -981,8 +987,9 @@ class YahooMailMCPServer {
                     reject(err);
                 });
 
-                fetch.once('end', () => {
+                fetch.once('end', async () => {
                     imap.end();
+                    await Promise.all(parses);
 
                     // Check for missing UIDs
                     const missingUIDs = uids.filter(uid => !foundUIDs.has(uid));
